@@ -30,100 +30,23 @@ The dataset that we use for this work are in the cif format.
 - [CIF](https://en.wikipedia.org/wiki/Crystallographic_Information_File) files recording the structure of the crystals that you are interested in
 - The values of the target properties for each crystal in the dataset.
 
-You can create a customized dataset by creating a directory `root_dir` with the following files: 
+You can create a customized pre-training dataset by creating a directory `root_dir` with the following files: 
 
-1. `id_prop.csv`: a [CSV](https://en.wikipedia.org/wiki/Comma-separated_values) file with two columns. The first column recodes a unique `ID` for each crystal, and the second column recodes the value of target property. If you want to predict material properties with `predict.py`, you can put any number in the second column. (The second column is still needed.)
+<!-- 1. `id_prop.csv`: a [CSV](https://en.wikipedia.org/wiki/Comma-separated_values) file with two columns. The first column recodes a unique `ID` for each crystal, and the second column recodes the value of target property. If you want to predict material properties with `predict.py`, you can put any number in the second column. (The second column is still needed.) -->
 
-2. `atom_init.json`: a [JSON](https://en.wikipedia.org/wiki/JSON) file that stores the initialization vector for each element. An example of `atom_init.json` is `data/sample-regression/atom_init.json`, which should be good for most applications. The `atom_init.json` file has some of the basic atomic features encoded. Please refer the supplementary information of the paper to find out more about the basic atomic features.
+1. `atom_init.json`: a [JSON](https://en.wikipedia.org/wiki/JSON) file that stores the initialization vector for each element. An example of `atom_init.json` is `data/sample-regression/atom_init.json`, which should be good for most applications. The `atom_init.json` file has some of the basic atomic features encoded. Please refer the supplementary information of the paper to find out more about the basic atomic features.
 
-3. `ID.cif`: a [CIF](https://en.wikipedia.org/wiki/Crystallographic_Information_File) file that recodes the crystal structure, where `ID` is the unique `ID` for the crystal.
+2. `ID.cif`: a [CIF](https://en.wikipedia.org/wiki/Crystallographic_Information_File) file that recodes the crystal structure, where `ID` is the unique `ID` for the crystal.
 
 The structure of the `root_dir` should be:
 
 ```
 root_dir
-├── id_prop.csv
 ├── atom_init.json
 ├── id0.cif
 ├── id1.cif
 ├── ...
 ```
-
-There are two examples of customized datasets in the repository: `data/sample-regression` for regression and `data/sample-classification` for classification. 
-
-**For advanced PyTorch users**
-The above method of creating a customized dataset uses the `CIFData` class in `ogcnn.data`. If you want a more flexible way to input crystal structures and more feture descriptors to the model, PyTorch has a great [Tutorial](http://pytorch.org/tutorials/beginner/data_loading_tutorial.html#sphx-glr-beginner-data-loading-tutorial-py) for writing your own dataset class.
-
-
-### Train a OGCNN model
-
-Before training a new CGCNN model, you will need to:
-
-- [Define a customized dataset](#define-a-customized-dataset) at `root_dir` to store the structure-property relations of interest.
-
-Then, in the directory that you choose to have main.py, you can train a OGCNN model for your customized dataset by:
-
-```bash
-python main.py root_dir
-```
-
-You can set the number of training, validation, and test data with labels `--train-size`, `--val-size`, and `--test-size`. Alternatively, you may use the flags `--train-ratio`, `--val-ratio`, `--test-ratio` instead. Note that the ratio flags cannot be used with the size flags simultaneously. For instance, `data/sample-regression` has 10 data points in total. You can train a model by:
-
-```bash
-python main.py --train-size 8 --val-size 1 --test-size 1 data/sample-regression
-```
-or alternatively
-```bash
-python main.py --train-ratio 0.8 --val-ratio 0.1 --test-ratio 0.1 data/sample-regression
-```
-
-You can also train a classification model with label `--task classification`. For instance, you can use `data/sample-classification` by:
-
-Although in the OGCNN work, we have not done any classification tasks. OGCNN similar to CGCNN has a switch to do the classification tasks which can run by using the following commands. 
-```bash
-python main.py --task classification --train-size 5 --val-size 2 --test-size 3 data/sample-classification
-```
-
-After training, you will get three files in the same directory as the main.py file.
-
-- `model_best.pth.tar`: stores the CGCNN model with the best validation accuracy.
-- `checkpoint.pth.tar`: stores the CGCNN model at the last epoch.
-- `test_results.csv`: stores the `ID`, target value, and predicted value for each crystal in test set.
-
-### Predict material properties with a pre-trained OGCNN model
-
-Before predicting the material properties, you will need to:
-
-- [Define a customized dataset](#define-a-customized-dataset) at `root_dir` for all the crystal structures that you want to predict.
-- Obtain a [pre-trained OGCNN model](pre-trained) named `pre-trained.pth.tar`.
-
-Then, in directory where you have your predict.py script, you can predict the properties of the crystals in `root_dir`:
-
-```bash
-python predict.py pre-trained.pth.tar root_dir
-```
-
-For instance, you can predict the formation energies of the crystals in `data/sample-regression`:
-
-```bash
-python predict.py pre-trained/formation-energy-per-atom.pth.tar data/sample-regression
-```
-
-After predicting, you will get one file in `ogcnn` directory:
-
-- `test_results.csv`: stores the `ID`, target value, and predicted value for each crystal in test set. Here the target value is just any number that you set while defining the dataset in `id_prop.csv`, which is not important.
-
-## Data
-
-To reproduce our paper, you can download the corresponding datasets following the [instruction](data/material-data).
-
-## Authors
-
-This work was primarily done by Rishikesh Magar,Mohammadreza Karamad and Yuting Shi and was advised by Prof. Amir Barati Farimani, CMU
-
-
-
-
-
+In this work, we aggregated the Matminer and the hMOF database for pretraining. The SSL models are likely to train better with larger datsets, if the users have aggregated larger datasets they can add it to the  `root_dir` 
 
 
