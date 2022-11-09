@@ -14,7 +14,7 @@ from torch.autograd import Variable
 from torch.optim.lr_scheduler import MultiStepLR
 from torch.utils.data import DataLoader
 
-from ogcnn.model import CrystalGraphConvNet
+from ogcnn.model import OrbitalCrystalGraphConvNet
 from ogcnn.data import collate_pool, get_train_val_test_loader
 from ogcnn.data import CIFData
 
@@ -30,6 +30,32 @@ parser.add_argument('--disable-cuda', action='store_true',
                     help='Disable CUDA')
 parser.add_argument('--print-freq', '-p', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
+
+parser.add_argument('--task', choices=['regression', 'classification'],
+                    default='regression', help='complete a regression or '
+                                                   'classification task (default: regression)')
+parser.add_argument('--atom-fea-len', default=1536, type=int, metavar='N',
+                    help='number of hidden atom features in conv layers')
+parser.add_argument('--hot-fea-len', default=768, type=int, metavar='N',
+                    help='number of hidden atom features in decoder')
+parser.add_argument('--h-fea-len', default=128, type=int, metavar='N',
+                    help='number of hidden features after pooling')
+parser.add_argument('--n-conv', default=3, type=int, metavar='N',
+                    help='number of conv layers')
+parser.add_argument('--n-h', default=1, type=int, metavar='N',
+                    help='number of hidden layers after pooling')
+parser.add_argument('--optim', default='SGD', type=str, metavar='SGD',
+                    help='choose an optimizer, SGD or Adam, (default: SGD)')
+parser.add_argument('--lr', '--learning-rate', default=0.0005, type=float,
+                    metavar='LR', help='initial learning rate (default: '
+                                       '0.0005)')
+parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
+                    help='momentum')
+parser.add_argument('--weight-decay', '--wd', default=0, type=float,
+                    metavar='W', help='weight decay (default: 0)')
+
+
+
 
 args = parser.parse_args(sys.argv[1:])
 if os.path.isfile(args.modelpath):
