@@ -1,3 +1,9 @@
+"""
+main.py
+The main execution script to train the Bond Embedding Orbital Graph Convolutional Neural Network (BE-OGCNN).
+It parses command line arguments to configure the dataset, model architecture (such as orbital embeddings or improved conv layers), 
+optimizer settings, and the training loop for either classification or regression tasks.
+"""
 import argparse
 import os
 import shutil
@@ -12,31 +18,39 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn import metrics
 from torch.autograd import Variable
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim.lr_scheduler import MultiStepLR,LambdaLR
 
 from ogcnn.data import CIFData
 from ogcnn.data import collate_pool, get_train_val_test_loader
 from ogcnn.model import OrbitalCrystalGraphConvNet
+import pandas as pd
 
 
-
-parser = argparse.ArgumentParser(description='Orbital Graph Convolutional Neural Networks')
+parser = argparse.ArgumentParser(description='Bond Embedding Orbital Graph Convolutional Neural Networks (BE-OGCNN)')
 parser.add_argument('data_options', metavar='OPTIONS', nargs='+',
                     help='dataset options, started with the path to root dir, '
                          'then other options')
+parser.add_argument('--validset', metavar='VALID', nargs='+', default=None,
+                    help='path to validation dataset')
+parser.add_argument('--testset', metavar='TEST', nargs='+', default=None,
+                    help='path to test dataset')
 parser.add_argument('--task', choices=['regression', 'classification'],
                     default='regression', help='complete a regression or '
                                                    'classification task (default: regression)')
 parser.add_argument('--disable-cuda', action='store_true',
-                    help='Disable CUDA')
+                    help='Disable CUDA (train on CPU)')
+parser.add_argument('--orbital', action='store_true',
+                    help='Use Orbital Graph Convolutional Neural Network features')
+parser.add_argument('--improved', action='store_true',
+                    help='Use ImprovedConvLayer with explicit edge updates')
 parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
                     help='number of data loading workers (default: 0)')
 parser.add_argument('--epochs', default=100, type=int, metavar='N',
-                    help='number of total epochs to run (default: 30)')
+                    help='number of total epochs to run (default: 100)')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
 parser.add_argument('-b', '--batch-size', default=32, type=int,
-                    metavar='N', help='mini-batch size (default: 256)')
+                    metavar='N', help='mini-batch size (default: 32)')
 parser.add_argument('--lr', '--learning-rate', default=0.0005, type=float,
                     metavar='LR', help='initial learning rate (default: '
                                        '0.0005)')
@@ -44,18 +58,21 @@ parser.add_argument('--lr-milestones', default=[100], nargs='+', type=int,
                     metavar='N', help='milestones for scheduler (default: '
                                       '[100])')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
-                    help='momentum')
+                    help='momentum for SGD optimizer')
 parser.add_argument('--weight-decay', '--wd', default=0, type=float,
                     metavar='W', help='weight decay (default: 0)')
 parser.add_argument('--print-freq', '-p', default=50, type=int,
                     metavar='N', help='print frequency (default: 50)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
+
+# Dataset Splitting Arguments
 train_group = parser.add_mutually_exclusive_group()
 train_group.add_argument('--train-ratio', default=None, type=float, metavar='N',
-                    help='number of training data to be loaded (default none)')
+                    help='percentage of training data to be loaded (default none)')
 train_group.add_argument('--train-size', default=None, type=int, metavar='N',
                          help='number of training data to be loaded (default none)')
+
 valid_group = parser.add_mutually_exclusive_group()
 valid_group.add_argument('--val-ratio', default=0.1, type=float, metavar='N',
                     help='percentage of validation data to be loaded (default '
@@ -63,14 +80,16 @@ valid_group.add_argument('--val-ratio', default=0.1, type=float, metavar='N',
 valid_group.add_argument('--val-size', default=None, type=int, metavar='N',
                          help='number of validation data to be loaded (default '
                               '1000)')
+
 test_group = parser.add_mutually_exclusive_group()
 test_group.add_argument('--test-ratio', default=0.1, type=float, metavar='N',
                     help='percentage of test data to be loaded (default 0.1)')
 test_group.add_argument('--test-size', default=None, type=int, metavar='N',
                         help='number of test data to be loaded (default 1000)')
 
-parser.add_argument('--optim', default='SGD', type=str, metavar='SGD',
-                    help='choose an optimizer, SGD or Adam, (default: SGD)')
+# Model Hyperparameters
+parser.add_argument('--optim', default='Adam', type=str, metavar='Adam',
+                    help='choose an optimizer, SGD or Adam, (default: Adam)')
 parser.add_argument('--atom-fea-len', default=1536, type=int, metavar='N',
                     help='number of hidden atom features in conv layers')
 parser.add_argument('--hot-fea-len', default=768, type=int, metavar='N',
@@ -82,6 +101,15 @@ parser.add_argument('--n-conv', default=3, type=int, metavar='N',
 parser.add_argument('--n-h', default=1, type=int, metavar='N',
                     help='number of hidden layers after pooling')
 
+# Loss function weighting criteria for multi-task regression handling
+parser.add_argument('--ad-weight', default=1, type=float, metavar='N',
+                    help='weight for primary loss function (Adsorption Target)')
+parser.add_argument('--d-weight', default=1, type=float, metavar='N',
+                    help='weight for secondary loss function (Target 1)')
+parser.add_argument('--e-weight', default=1, type=float, metavar='N',
+                    help='weight for tertiary loss function (Target 2)')
+parser.add_argument("--not-record", action="store_true", help="do not record the training process")
+
 args = parser.parse_args(sys.argv[1:])
 
 args.cuda = not args.disable_cuda and torch.cuda.is_available()
@@ -92,43 +120,143 @@ else:
     best_mae_error = 0.
 
 
+def return_normalizer_indices(dataset):
+    sample_data_list = [dataset[i] for i in range(len(dataset))]
+    _, sample_target, sample_target1, sample_target2, _ = collate_pool(sample_data_list)
+    normalizer = Normalizer(sample_target)
+    normalizer1 = Normalizer(sample_target1)
+    normalizer2 = Normalizer(sample_target2)
+    sample_target = torch.reshape(sample_target,shape=(-1,))
+    attribute_indices = {}
+    attribute_indices['catalyst'] = torch.where(~torch.isnan(sample_target))[0].numpy()
+    attribute_indices['noncatalyst'] = torch.where(torch.isnan(sample_target))[0].numpy()
+    np.random.shuffle(attribute_indices['catalyst'])
+    np.random.shuffle(attribute_indices['noncatalyst'])
+    return normalizer, normalizer1, normalizer2, attribute_indices
+
+
 def main():
     global args, best_mae_error
+    df=pd.DataFrame(columns=['epoch','train','valid'])
 
     # load data
-    dataset = CIFData(*args.data_options)
-    collate_fn = collate_pool
-    train_loader, val_loader, test_loader = get_train_val_test_loader(
-        dataset=dataset,
-        collate_fn=collate_fn,
-        batch_size=args.batch_size,
-        train_ratio=args.train_ratio,
-        num_workers=args.workers,
-        val_ratio=args.val_ratio,
-        test_ratio=args.test_ratio,
-        pin_memory=args.cuda,
-        train_size=args.train_size,
-        val_size=args.val_size,
-        test_size=args.test_size,
-        return_test=True)
+    if args.validset is None:
+        dataset = CIFData(*args.data_options,orbital=args.orbital)
+        normalizer, normalizer1, normalizer2, attribute_indices = return_normalizer_indices(dataset)
+        collate_fn = collate_pool
+        train_loader, val_loader, test_loader = get_train_val_test_loader(
+            dataset=dataset,
+            collate_fn=collate_fn,
+            batch_size=args.batch_size,
+            train_ratio=args.train_ratio,
+            num_workers=args.workers,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+            pin_memory=args.cuda,
+            train_size=args.train_size,
+            val_size=args.val_size,
+            test_size=args.test_size,
+            attribute_indices=attribute_indices,
+            return_test=True)
+    elif args.testset is None:
+        dataset = CIFData(*args.data_options,orbital=args.orbital)
+        normalizer, normalizer1, normalizer2, attribute_indices = return_normalizer_indices(dataset)
+        collate_fn = collate_pool
+        train_loader, _ = get_train_val_test_loader(
+            dataset=dataset,
+            collate_fn=collate_fn,
+            batch_size=args.batch_size,
+            train_ratio=1,
+            num_workers=args.workers,
+            val_ratio=0,
+            test_ratio=0,
+            pin_memory=args.cuda,
+            train_size=args.train_size,
+            val_size=args.val_size,
+            test_size=args.test_size,
+            attribute_indices=attribute_indices,
+            return_test=False)
+        dataset = CIFData(*args.validset,orbital=args.orbital)
+        _, _, _, attribute_indices = return_normalizer_indices(dataset)
+        collate_fn = collate_pool
+        val_loader, test_loader = get_train_val_test_loader(
+            dataset=dataset,
+            collate_fn=collate_fn,
+            batch_size=args.batch_size,
+            # batch_size=len(dataset),
+            train_ratio=1-args.test_ratio,
+            num_workers=args.workers,
+            val_ratio=args.test_ratio,
+            test_ratio=0,
+            pin_memory=args.cuda,
+            train_size=args.train_size,
+            val_size=args.val_size,
+            test_size=args.test_size,
+            attribute_indices=attribute_indices,
+            return_test=False)
+
+    else:
+        dataset = CIFData(*args.data_options,orbital=args.orbital)
+        normalizer, normalizer1, normalizer2, attribute_indices = return_normalizer_indices(dataset)
+        collate_fn = collate_pool
+        train_loader, _ = get_train_val_test_loader(
+            dataset=dataset,
+            collate_fn=collate_fn,
+            batch_size=args.batch_size,
+            train_ratio=1,
+            num_workers=args.workers,
+            val_ratio=0,
+            test_ratio=0,
+            pin_memory=args.cuda,
+            train_size=args.train_size,
+            val_size=args.val_size,
+            test_size=args.test_size,
+            attribute_indices=attribute_indices,
+            return_test=False)
+        dataset = CIFData(*args.validset,orbital=args.orbital)
+        _, _, _, attribute_indices = return_normalizer_indices(dataset)
+        collate_fn = collate_pool
+        val_loader, _ = get_train_val_test_loader(
+            dataset=dataset,
+            collate_fn=collate_fn,
+            batch_size=args.batch_size,
+            train_ratio=1,
+            num_workers=args.workers,
+            val_ratio=0,
+            test_ratio=0,
+            pin_memory=args.cuda,
+            train_size=args.train_size,
+            val_size=args.val_size,
+            test_size=args.test_size,
+            attribute_indices=attribute_indices,
+            return_test=False)
+        dataset = CIFData(*args.testset,orbital=args.orbital)
+        _, _, _, attribute_indices = return_normalizer_indices(dataset)
+        collate_fn = collate_pool
+        test_loader, _ = get_train_val_test_loader(
+            dataset=dataset,
+            collate_fn=collate_fn,
+            batch_size=args.batch_size,
+            train_ratio=1,
+            num_workers=args.workers,
+            val_ratio=0,
+            test_ratio=0,
+            pin_memory=args.cuda,
+            train_size=args.train_size,
+            val_size=args.val_size,
+            test_size=args.test_size,
+            attribute_indices=attribute_indices,
+            return_test=False)
 
     # obtain target value normalizer
     if args.task == 'classification':
         normalizer = Normalizer(torch.zeros(2))
         normalizer.load_state_dict({'mean': 0., 'std': 1.})
     else:
-        if len(dataset) < 500:
-            warnings.warn('Dataset has less than 500 data points. '
-                          'Lower accuracy is expected. ')
-            sample_data_list = [dataset[i] for i in range(len(dataset))]
-        else:
-            sample_data_list = [dataset[i] for i in
-                                sample(range(len(dataset)), 500)]
-        _, sample_target, _ = collate_pool(sample_data_list)
-        normalizer = Normalizer(sample_target)
+        pass
 
     # build model
-    structures, _, _ = dataset[0]
+    structures, _, _, _, _ = dataset[0]
 
     orig_atom_fea_len = structures[0][0].shape[-1]     #92 features per atom
     ofm_fea= int(structures[0][1].shape[0]/structures[0][0].shape[0])
@@ -138,14 +266,19 @@ def main():
     hot_fea_len = args.hot_fea_len
     n_conv = args.n_conv
     h_fea_len = args.h_fea_len
-    orig_atom_fea_len = orig_atom_fea_len + orig_hot_fea_len
+    if args.orbital:
+        orig_atom_fea_len = orig_atom_fea_len + orig_hot_fea_len
+    else:
+        orig_atom_fea_len = orig_atom_fea_len # + orig_hot_fea_len
 
-    model = OrbitalCrystalGraphConvNet(orig_atom_fea_len, nbr_fea_len,orig_hot_fea_len,
+    model = OrbitalCrystalGraphConvNet(orig_atom_fea_len, nbr_fea_len, orig_hot_fea_len,
                                  atom_fea_len=atom_fea_len,
                                  hot_fea_len=hot_fea_len,
                                  n_conv=n_conv,
                                  h_fea_len=h_fea_len,
                                  n_h=args.n_h,
+                                 orbital=args.orbital,
+                                 improved=args.improved,
                                  classification=True if args.task ==
                                                         'classification' else False)
 
@@ -156,7 +289,7 @@ def main():
     if args.task == 'classification':
         criterion = nn.NLLLoss()
     else:
-        criterion = nn.MSELoss()
+        criterion = nn.L1Loss()
     if args.optim == 'SGD':
         optimizer = optim.SGD(model.parameters(), args.lr,
                               momentum=args.momentum,
@@ -177,21 +310,27 @@ def main():
             model.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
             normalizer.load_state_dict(checkpoint['normalizer'])
+            normalizer1.load_state_dict(checkpoint['normalizer1'])
+            normalizer2.load_state_dict(checkpoint['normalizer2'])
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
-    scheduler = MultiStepLR(optimizer, milestones=args.lr_milestones,
-                            gamma=0.1)
+    # scheduler = MultiStepLR(optimizer, milestones=args.lr_milestones,
+    #                         gamma=0.1)
+    scheduler = LambdaLR(optimizer, lr_lambda=lambda epoch: 0.99 ** epoch)
+    # scheduler.last_epoch = args.start_epoch - 1
+    # if args.resume:
+    #     scheduler.step()
 
     for epoch in range(args.start_epoch, args.epochs):
-        train(train_loader, model, criterion, optimizer, epoch, normalizer)
-        mae_error = validate(val_loader, model, criterion, normalizer)
+        train_error = train(train_loader, model, criterion, optimizer, epoch, normalizer, normalizer1, normalizer2, args.ad_weight, args.d_weight, args.e_weight)
+        mae_error = validate(val_loader, model, criterion, epoch, normalizer, normalizer1, normalizer2)
 
-        if mae_error != mae_error:
-            print('Exit due to NaN')
-            sys.exit(1)
+        # if mae_error != mae_error:
+        #     print('Exit due to NaN')
+        #     sys.exit(1)
 
         scheduler.step()
 
@@ -208,22 +347,34 @@ def main():
             'best_mae_error': best_mae_error,
             'optimizer': optimizer.state_dict(),
             'normalizer': normalizer.state_dict(),
+            'normalizer1': normalizer1.state_dict(),
+            'normalizer2': normalizer2.state_dict(),
             'args': vars(args)
         }, is_best)
+        if type(mae_error) is torch.Tensor:
+            row = pd.DataFrame([[epoch,train_error.item(),mae_error.item()]],columns=df.columns)
+        else:
+            row = pd.DataFrame([[epoch,train_error.item(),mae_error]],columns=df.columns)
+        df = pd.concat([df,row],ignore_index=True)
+        if args.not_record:
+            continue
+        df.to_csv('./log.csv',index=False,float_format='%.4f')
 
     # test best model
     print('---------Evaluate Model on Test Set---------------')
-    best_checkpoint = torch.load('model_best.pth.tar')
+    best_checkpoint = torch.load('./models/model_best.pth.tar')
     model.load_state_dict(best_checkpoint['state_dict'])
-    validate(test_loader, model, criterion, normalizer, test=True)
+    validate(test_loader, model, criterion, 0, normalizer, normalizer1, normalizer2, test=True)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, normalizer):
+def train(train_loader, model, criterion, optimizer, epoch, normalizer, normalizer1, normalizer2, ad_weight=1, d_weight=1, e_weight=1):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
     if args.task == 'regression':
         mae_errors = AverageMeter()
+        mae_errors1 = AverageMeter()
+        mae_errors2 = AverageMeter()
     else:
         accuracies = AverageMeter()
         precisions = AverageMeter()
@@ -236,37 +387,93 @@ def train(train_loader, model, criterion, optimizer, epoch, normalizer):
     epoch_loss = 0
 
     end = time.time()
-    for i, (input, target, batch_cif_ids) in enumerate(train_loader):     
+    for i, (input, target, target1, target2, batch_cif_ids) in enumerate(train_loader):     
         data_time.update(time.time() - end)
 
         if args.cuda:
-            input_var = (Variable(torch.cat((input[0][0],input[0][1].reshape(int(input[0][1].shape[0]/32),1056)),dim=1).cuda(non_blocking=True)),
+            if args.orbital:
+                input_var = (Variable(torch.cat((input[0][0],input[0][1].reshape(int(input[0][1].shape[0]/32),1056)),dim=1).cuda(non_blocking=True)),
                          Variable(input[1].cuda(non_blocking=True)),
                          input[2].cuda(non_blocking=True),
-                         [crys_idx.cuda(non_blocking=True) for crys_idx in input[3]])
+                         [crys_idx.cuda(non_blocking=True) for crys_idx in input[3]],
+                         [crys_idx.cuda(non_blocking=True) for crys_idx in input[4]])
+            else:
+                input_var = (Variable(input[0][0].cuda(non_blocking=True)),
+                            Variable(input[1].cuda(non_blocking=True)),
+                            input[2].cuda(non_blocking=True),
+                            [crys_idx.cuda(non_blocking=True) for crys_idx in input[3]],
+                            [crys_idx.cuda(non_blocking=True) for crys_idx in input[4]])
         else:
-            input_var = (Variable(torch.cat((input[0][0],input[0][1].reshape(int(input[0][1].shape[0]/32),1056)),dim=1).cuda(non_blocking=True)),
+            if args.orbital:
+                input_var = (Variable(torch.cat((input[0][0],input[0][1].reshape(int(input[0][1].shape[0]/32),1056)),dim=1)),
                          Variable(input[1]),
                          input[2],
-                         input[3])
+                         input[3],
+                         input[4])
+            else:
+                input_var = (Variable(input[0][0]),
+                            Variable(input[1]),
+                            input[2],
+                            input[3],
+                            input[4])
         # normalize target
         if args.task == 'regression':
             target_normed = normalizer.norm(target)
+            target_normed1 = normalizer1.norm(target1)
+            target_normed2 = normalizer2.norm(target2)
         else:
             target_normed = target.view(-1).long()
         if args.cuda:
             target_var = Variable(target_normed.cuda(non_blocking=True))
+            target_var1 = Variable(target_normed1.cuda(non_blocking=True))
+            target_var2 = Variable(target_normed2.cuda(non_blocking=True))
         else:
             target_var = Variable(target_normed)
+            target_var1 = Variable(target_normed1)
+            target_var2 = Variable(target_normed2)
 
         # compute output
-        output = model(*input_var)
+        output, output1, output2 = model(*input_var)
+        output = torch.reshape(output, (-1,))
+        output1 = torch.reshape(output1, (-1,))
+        output2 = torch.reshape(output2, (-1,))
+        target_var = torch.reshape(target_var, (-1,))
+        target_var1 = torch.reshape(target_var1, (-1,))
+        target_var2 = torch.reshape(target_var2, (-1,))
+        output = output[~torch.isnan(target_var)]
+        target_var = target_var[~torch.isnan(target_var)]
+        output1 = output1[~torch.isnan(target_var1)]
+        target_var1 = target_var1[~torch.isnan(target_var1)]
+        output2 = output2[~torch.isnan(target_var2)]
+        target_var2 = target_var2[~torch.isnan(target_var2)]
+
         loss = criterion(output, target_var)
+        loss1 = criterion(output1, target_var1)
+        loss2 = criterion(output2, target_var2)
+        tmp=[]
+        if loss == loss:
+            tmp.append(ad_weight*loss)
+        if loss1 == loss1:
+            tmp.append(d_weight*loss1)
+        if loss2 == loss2:
+            tmp.append(e_weight*loss2)
+        loss = sum(tmp)
+
+        target = torch.reshape(target, (-1,))
+        target1 = torch.reshape(target1, (-1,))
+        target2 = torch.reshape(target2, (-1,))
+        target = target[~torch.isnan(target)]
+        target1 = target1[~torch.isnan(target1)]
+        target2 = target2[~torch.isnan(target2)]
 
         if args.task == 'regression':
             mae_error = mae(normalizer.denorm(output.data.cpu()), target)
+            mae_error1 = mae(normalizer1.denorm(output1.data.cpu()), target1)
+            mae_error2 = mae(normalizer2.denorm(output2.data.cpu()), target2)
             losses.update(loss.data.cpu(), target.size(0))
             mae_errors.update(mae_error, target.size(0))
+            mae_errors1.update(mae_error1, target1.size(0))
+            mae_errors2.update(mae_error2, target2.size(0))
         else:
             accuracy, precision, recall, fscore, auc_score = \
                 class_eval(output.data.cpu(), target)
@@ -284,52 +491,61 @@ def train(train_loader, model, criterion, optimizer, epoch, normalizer):
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % args.print_freq == 0:
-            if args.task == 'regression':
-            	print('done')
-            	print('Epoch: [{0}][{1}/{2}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'MAE {mae_errors.val:.3f} ({mae_errors.avg:.3f})'.format(
-                    epoch, i, len(train_loader), batch_time=batch_time,
-                    data_time=data_time, loss=losses, mae_errors=mae_errors)
-                )
-            else:
-                print('Epoch: [{0}][{1}/{2}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'Accu {accu.val:.3f} ({accu.avg:.3f})\t'
-                      'Precision {prec.val:.3f} ({prec.avg:.3f})\t'
-                      'Recall {recall.val:.3f} ({recall.avg:.3f})\t'
-                      'F1 {f1.val:.3f} ({f1.avg:.3f})\t'
-                      'AUC {auc.val:.3f} ({auc.avg:.3f})'.format(
-                    epoch, i, len(train_loader), batch_time=batch_time,
-                    data_time=data_time, loss=losses, accu=accuracies,
-                    prec=precisions, recall=recalls, f1=fscores,
-                    auc=auc_scores)
-                )
+    if epoch % args.print_freq == 0:
+        if args.task == 'regression':
+            # print('done')
+            print('Epoch: [{0}]\t'
+                #   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                #   'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                #   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                    'MAE {mae_errors.avg:.3f}\t MAE1 {mae_errors1.avg:.3f}\t MAE2 {mae_errors2.avg:.3f}'.format(
+                epoch,#len(train_loader), batch_time=batch_time,
+                #data_time=data_time, loss=losses, 
+                mae_errors=mae_errors, mae_errors1=mae_errors1, mae_errors2=mae_errors2)
+            )
+        else:
+            print('Epoch: [{0}][{1}/{2}]\t'
+                    'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                    'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                    'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                    'Accu {accu.val:.3f} ({accu.avg:.3f})\t'
+                    'Precision {prec.val:.3f} ({prec.avg:.3f})\t'
+                    'Recall {recall.val:.3f} ({recall.avg:.3f})\t'
+                    'F1 {f1.val:.3f} ({f1.avg:.3f})\t'
+                    'AUC {auc.val:.3f} ({auc.avg:.3f})'.format(
+                epoch, i, len(train_loader), batch_time=batch_time,
+                data_time=data_time, loss=losses, accu=accuracies,
+                prec=precisions, recall=recalls, f1=fscores,
+                auc=auc_scores)
+            )
     torch.cuda.empty_cache()
     del input
     del target
+    del target1
+    del target2
     del batch_cif_ids
+    del input_var, target_var, target_var1, target_var2
+    del output, output1, output2
+    del loss, loss1, loss2
+    return mae_errors.avg
 
-def validate(val_loader, model, criterion, normalizer, test=False):
+def validate(val_loader, model, criterion, epoch, normalizer, normalizer1, normalizer2, test=False):
     batch_time = AverageMeter()
     losses = AverageMeter()
     if args.task == 'regression':
         mae_errors = AverageMeter()
+        mae_errors1 = AverageMeter()
+        mae_errors2 = AverageMeter()
     else:
         accuracies = AverageMeter()
         precisions = AverageMeter()
         recalls = AverageMeter()
         fscores = AverageMeter()
         auc_scores = AverageMeter()
-    if test:
-        test_targets = []
-        test_preds = []
-        test_cif_ids = []
+    # if test:
+    test_targets = []
+    test_preds = []
+    test_cif_ids = []
 
     # switch to evaluate mode
     model.eval()
@@ -337,49 +553,95 @@ def validate(val_loader, model, criterion, normalizer, test=False):
     end = time.time()
    
     epoch_loss = 0
-    for i, (input, target, batch_cif_ids) in enumerate(val_loader):
+    for i, (input, target, target1, target2, batch_cif_ids) in enumerate(val_loader):
         if args.cuda:
             with torch.no_grad():
-                input_var = (Variable(torch.cat((input[0][0],input[0][1].reshape(int(input[0][1].shape[0]/32),1056)),dim=1).cuda(non_blocking=True)),
+                if args.orbital:
+                    input_var = (Variable(torch.cat((input[0][0],input[0][1].reshape(int(input[0][1].shape[0]/32),1056)),dim=1).cuda(non_blocking=True)),
                              Variable(input[1].cuda(non_blocking=True)),
                              input[2].cuda(non_blocking=True),
-                             [crys_idx.cuda(non_blocking=True) for crys_idx in input[3]])
+                             [crys_idx.cuda(non_blocking=True) for crys_idx in input[3]],
+                             [crys_idx.cuda(non_blocking=True) for crys_idx in input[4]])
+                else:
+                    input_var = (Variable(input[0][0].cuda(non_blocking=True)),
+                                Variable(input[1].cuda(non_blocking=True)),
+                                input[2].cuda(non_blocking=True),
+                                [crys_idx.cuda(non_blocking=True) for crys_idx in input[3]],
+                                [crys_idx.cuda(non_blocking=True) for crys_idx in input[4]])
         else:
             with torch.no_grad():
-                input_var = (Variable(torch.cat((input[0][0],input[0][1].reshape(int(input[0][1].shape[0]/32),1056)),dim=1)),
+                if args.orbital:
+                    input_var = (Variable(torch.cat((input[0][0],input[0][1].reshape(int(input[0][1].shape[0]/32),1056)),dim=1)),
                              Variable(input[1]),
                              input[2],
-                             input[3])
+                             input[3],
+                             input[4])
+                else:
+                    input_var = (Variable(input[0][0]),
+                                Variable(input[1]),
+                                input[2],
+                                input[3],
+                                input[4])
         if args.task == 'regression':
             target_normed = normalizer.norm(target)
+            target_normed1 = normalizer1.norm(target1)
+            target_normed2 = normalizer2.norm(target2)
         else:
             target_normed = target.view(-1).long()
         if args.cuda:
             with torch.no_grad():
                 target_var = Variable(target_normed.cuda(non_blocking=True))
+                target_var1 = Variable(target_normed1.cuda(non_blocking=True))
+                target_var2 = Variable(target_normed2.cuda(non_blocking=True))
         else:
             with torch.no_grad():
                 target_var = Variable(target_normed)
+                target_var1 = Variable(target_normed1)
+                target_var2 = Variable(target_normed2)
 
         # compute output
-        output = model(*input_var)
-        loss = criterion(output, target_var)
+        output, output1, output2 = model(*input_var)
+        output = torch.reshape(output, (-1,))
+        output1 = torch.reshape(output1, (-1,))
+        output2 = torch.reshape(output2, (-1,))
+        target_var = torch.reshape(target_var, (-1,))
+        target_var1 = torch.reshape(target_var1, (-1,))
+        target_var2 = torch.reshape(target_var2, (-1,))
+        output = output[~torch.isnan(target_var)]
+        target_var = target_var[~torch.isnan(target_var)]
+        output1 = output1[~torch.isnan(target_var1)]
+        target_var1 = target_var1[~torch.isnan(target_var1)]
+        output2 = output2[~torch.isnan(target_var2)]
+        target_var2 = target_var2[~torch.isnan(target_var2)]
+
+        # loss = criterion(output, target_var)
+
+        target = torch.reshape(target, (-1,))
+        target1 = torch.reshape(target1, (-1,))
+        target2 = torch.reshape(target2, (-1,))
+        target = target[~torch.isnan(target)]
+        target1 = target1[~torch.isnan(target1)]
+        target2 = target2[~torch.isnan(target2)]
   
         # measure accuracy and record loss
         if args.task == 'regression':
             mae_error = mae(normalizer.denorm(output.data.cpu()), target)
-            losses.update(loss.data.cpu().item(), target.size(0))
+            mae_error1 = mae(normalizer1.denorm(output1.data.cpu()), target1)
+            mae_error2 = mae(normalizer2.denorm(output2.data.cpu()), target2)
+            # losses.update(loss.data.cpu().item(), target.size(0))
             mae_errors.update(mae_error, target.size(0))
-            if test:
-                test_pred = normalizer.denorm(output.data.cpu())
-                test_target = target
-                test_preds += test_pred.view(-1).tolist()
-                test_targets += test_target.view(-1).tolist()
-                test_cif_ids += batch_cif_ids
+            mae_errors1.update(mae_error1, target1.size(0))
+            mae_errors2.update(mae_error2, target2.size(0))
+            # if test:
+            test_pred = normalizer.denorm(output.data.cpu())
+            test_target = target
+            test_preds += test_pred.view(-1).tolist()
+            test_targets += test_target.view(-1).tolist()
+            test_cif_ids += batch_cif_ids
         else:
             accuracy, precision, recall, fscore, auc_score = \
                 class_eval(output.data.cpu(), target)
-            losses.update(loss.data.cpu().item(), target.size(0))
+            # losses.update(loss.data.cpu().item(), target.size(0))
             accuracies.update(accuracy, target.size(0))
             precisions.update(precision, target.size(0))
             recalls.update(recall, target.size(0))
@@ -397,29 +659,38 @@ def validate(val_loader, model, criterion, normalizer, test=False):
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % args.print_freq == 0:
-            if args.task == 'regression':
-                print('Test: [{0}/{1}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'MAE {mae_errors.val:.3f} ({mae_errors.avg:.3f})'.format(
-                    i, len(val_loader), batch_time=batch_time, loss=losses,
-                    mae_errors=mae_errors))
-            else:
-                print('Test: [{0}/{1}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'Accu {accu.val:.3f} ({accu.avg:.3f})\t'
-                      'Precision {prec.val:.3f} ({prec.avg:.3f})\t'
-                      'Recall {recall.val:.3f} ({recall.avg:.3f})\t'
-                      'F1 {f1.val:.3f} ({f1.avg:.3f})\t'
-                      'AUC {auc.val:.3f} ({auc.avg:.3f})'.format(
-                    i, len(val_loader), batch_time=batch_time, loss=losses,
-                    accu=accuracies, prec=precisions, recall=recalls,
-                    f1=fscores, auc=auc_scores))
+    if epoch % args.print_freq == 0:
+        if args.task == 'regression':
+            print('Test: [{0}]\t'
+                #   'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                #   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                    'MAE {mae_errors.avg:.3f}\t MAE1 {mae_errors1.avg:.3f}\t MAE2 {mae_errors2.avg:.3f}'.format(
+                epoch, mae_errors=mae_errors, mae_errors1=mae_errors1, mae_errors2=mae_errors2))
+        else:
+            print('Test: [{0}/{1}]\t'
+                    'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                    'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                    'Accu {accu.val:.3f} ({accu.avg:.3f})\t'
+                    'Precision {prec.val:.3f} ({prec.avg:.3f})\t'
+                    'Recall {recall.val:.3f} ({recall.avg:.3f})\t'
+                    'F1 {f1.val:.3f} ({f1.avg:.3f})\t'
+                    'AUC {auc.val:.3f} ({auc.avg:.3f})'.format(
+                i, len(val_loader), batch_time=batch_time, loss=losses,
+                accu=accuracies, prec=precisions, recall=recalls,
+                f1=fscores, auc=auc_scores))
+    if len(val_loader) == 0:
+        if args.task == 'regression':
+            return 0
+        else:
+            return 0
     del input
     del batch_cif_ids
     del target
+    del target1
+    del target2
+    del input_var, target_var, target_var1, target_var2
+    del output, output1, output2
+    # del loss
     torch.cuda.empty_cache()
 
     if test:
@@ -433,11 +704,11 @@ def validate(val_loader, model, criterion, normalizer, test=False):
     else:
         star_label = '*'
     if args.task == 'regression':
-    	print(' {star} MAE {mae_errors.avg:.3f}'.format(star=star_label, mae_errors=mae_errors))
-    	return mae_errors.avg
+        # print(' {star} MAE {mae_errors.avg:.3f}'.format(star=star_label, mae_errors=mae_errors))
+        return mae_errors.avg
     else:
-        print(' {star} AUC {auc.avg:.3f}'.format(star=star_label,
-                                                 auc=auc_scores))
+        # print(' {star} AUC {auc.avg:.3f}'.format(star=star_label,
+        #                                          auc=auc_scores))
         return auc_scores.avg
 
 class Normalizer(object):
@@ -445,8 +716,11 @@ class Normalizer(object):
 
     def __init__(self, tensor):
         """tensor is taken as a sample to calculate the mean and std"""
-        self.mean = torch.mean(tensor)
-        self.std = torch.std(tensor)
+        tensor = tensor.view(-1)
+        self.mean = torch.mean(tensor[~torch.isnan(tensor)])
+        self.std = torch.std(tensor[~torch.isnan(tensor)])
+        if self.std == 0:
+            self.std = 1.0
 
     def norm(self, tensor):
         return (tensor - self.mean) / self.std
@@ -512,10 +786,10 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+def save_checkpoint(state, is_best, filename='./models/checkpoint.pth.tar'):
     torch.save(state, filename)
     if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+        shutil.copyfile(filename, './models/model_best.pth.tar')
 
 
 def adjust_learning_rate(optimizer, epoch, k):

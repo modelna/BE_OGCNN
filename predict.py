@@ -1,3 +1,9 @@
+"""
+predict.py
+Script to evaluate a trained Bond Embedding Orbital Graph Convolutional Neural Network (BE-OGCNN)
+on new crystal structures (provided as CIF files). This script loads a saved model checkpoint
+and outputs predictions to a CSV file.
+"""
 import argparse
 import sys
 import os
@@ -19,15 +25,15 @@ from ogcnn.data import collate_pool, get_train_val_test_loader
 from ogcnn.data import CIFData
 
 
-parser = argparse.ArgumentParser(description='Orbital Crystal gated neural networks')
-parser.add_argument('modelpath', help='path to the trained model.')
-parser.add_argument('cifpath', help='path to the directory of CIF files.')
+parser = argparse.ArgumentParser(description='Bond Embedding Orbital Graph Convolutional Neural Networks Prediction')
+parser.add_argument('modelpath', help='path to the trained model (.pth.tar file)')
+parser.add_argument('cifpath', help='path to the directory of CIF files to evaluate')
 parser.add_argument('-b', '--batch-size', default=256, type=int,
                     metavar='N', help='mini-batch size (default: 256)')
 parser.add_argument('-j', '--workers', default=0, type=int, metavar='N',
                     help='number of data loading workers (default: 0)')
 parser.add_argument('--disable-cuda', action='store_true',
-                    help='Disable CUDA')
+                    help='Disable CUDA (run on CPU)')
 parser.add_argument('--print-freq', '-p', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 
@@ -45,17 +51,13 @@ parser.add_argument('--n-conv', default=3, type=int, metavar='N',
 parser.add_argument('--n-h', default=1, type=int, metavar='N',
                     help='number of hidden layers after pooling')
 parser.add_argument('--optim', default='SGD', type=str, metavar='SGD',
-                    help='choose an optimizer, SGD or Adam, (default: SGD)')
+                    help='choose an optimizer, SGD or Adam, (default: SGD). Note: Not actively used in prediction.')
 parser.add_argument('--lr', '--learning-rate', default=0.0005, type=float,
-                    metavar='LR', help='initial learning rate (default: '
-                                       '0.0005)')
+                    metavar='LR', help='initial learning rate (default: 0.0005)')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
-                    help='momentum')
+                    help='momentum (Not actively used parameter in predict.py)')
 parser.add_argument('--weight-decay', '--wd', default=0, type=float,
                     metavar='W', help='weight decay (default: 0)')
-
-
-
 
 args = parser.parse_args(sys.argv[1:])
 if os.path.isfile(args.modelpath):
@@ -81,22 +83,29 @@ def main():
     # load data
     dataset = CIFData(args.cifpath)
     collate_fn = collate_pool
-    test_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
+    if len(dataset) < 1000:
+        batch_size = len(dataset)
+    else:
+        batch_size = args.batch_size
+    test_loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                              num_workers=args.workers, collate_fn=collate_fn,
                              pin_memory=args.cuda)
 
     # build model
-    structures, _, _ = dataset[0]
+    structures, _, _, _, _ = dataset[0]
 
     orig_atom_fea_len = structures[0][0].shape[-1]     #92 features per atom
     ofm_fea= int(structures[0][1].shape[0]/structures[0][0].shape[0])
     nbr_fea_len = structures[1].shape[-1]      # 41 features per atom neighbors'
     orig_hot_fea_len = structures[0][1].shape[1]*ofm_fea       # 1056 features per crystal
-    atom_fea_len = args.atom_fea_len
-    hot_fea_len = args.hot_fea_len
-    n_conv = args.n_conv
-    h_fea_len = args.h_fea_len
+    atom_fea_len = model_args.atom_fea_len
+    hot_fea_len = model_args.hot_fea_len
+    n_conv = model_args.n_conv
+    h_fea_len = model_args.h_fea_len
     orig_atom_fea_len = orig_atom_fea_len + orig_hot_fea_len
+
+    model_orbital = getattr(model_args, 'orbital', False)
+    model_improved = getattr(model_args, 'improved', False)
 
     model = OrbitalCrystalGraphConvNet(orig_atom_fea_len, nbr_fea_len,orig_hot_fea_len,
                                  atom_fea_len=atom_fea_len,
@@ -104,6 +113,8 @@ def main():
                                  n_conv=n_conv,
                                  h_fea_len=h_fea_len,
                                  n_h=args.n_h,
+                                 orbital=model_orbital,
+                                 improved=model_improved,
                                  classification=True if args.task ==
                                                         'classification' else False)
     if args.cuda:
@@ -125,6 +136,8 @@ def main():
         raise NameError('Only SGD or Adam is allowed as --optim')
 
     normalizer = Normalizer(torch.zeros(3))
+    normalizer1 = Normalizer(torch.zeros(3))
+    normalizer2 = Normalizer(torch.zeros(3))
 
     # optionally resume from a checkpoint
     if os.path.isfile(args.modelpath):
@@ -133,20 +146,24 @@ def main():
                                 map_location=lambda storage, loc: storage)
         model.load_state_dict(checkpoint['state_dict'])
         normalizer.load_state_dict(checkpoint['normalizer'])
+        normalizer1.load_state_dict(checkpoint['normalizer1'])
+        normalizer2.load_state_dict(checkpoint['normalizer2'])
         print("=> loaded model '{}' (epoch {}, validation {})"
               .format(args.modelpath, checkpoint['epoch'],
                       checkpoint['best_mae_error']))
     else:
         print("=> no model found at '{}'".format(args.modelpath))
 
-    validate(test_loader, model, criterion, normalizer, test=True)
+    validate(test_loader, model, criterion, normalizer, normalizer1, normalizer2, test=True)
 
 
-def validate(val_loader, model, criterion, normalizer, test=False):
+def validate(val_loader, model, criterion, normalizer, normalizer1, normalizer2, test=False):
     batch_time = AverageMeter()
     losses = AverageMeter()
     if args.task == 'regression':
         mae_errors = AverageMeter()
+        mae_errors1 = AverageMeter()
+        mae_errors2 = AverageMeter()
     else:
         accuracies = AverageMeter()
         precisions = AverageMeter()
@@ -156,6 +173,10 @@ def validate(val_loader, model, criterion, normalizer, test=False):
     if test:
         test_targets = []
         test_preds = []
+        test_targets1 = []
+        test_preds1 = []
+        test_targets2 = []
+        test_preds2 = []
         test_cif_ids = []
 
     # switch to evaluate mode
@@ -164,21 +185,38 @@ def validate(val_loader, model, criterion, normalizer, test=False):
     end = time.time()
    
     epoch_loss = 0
-    for i, (input, target, batch_cif_ids) in enumerate(val_loader):
+    model_orbital = getattr(model_args, 'orbital', False)
+    for i, (input, target, target1, target2, batch_cif_ids) in enumerate(val_loader):
         if args.cuda:
-            with torch.no_grad():
+            if model_orbital:
                 input_var = (Variable(torch.cat((input[0][0],input[0][1].reshape(int(input[0][1].shape[0]/32),1056)),dim=1).cuda(non_blocking=True)),
-                             Variable(input[1].cuda(non_blocking=True)),
-                             input[2].cuda(non_blocking=True),
-                             [crys_idx.cuda(non_blocking=True) for crys_idx in input[3]])
+                         Variable(input[1].cuda(non_blocking=True)),
+                         input[2].cuda(non_blocking=True),
+                         [crys_idx.cuda(non_blocking=True) for crys_idx in input[3]],
+                         [crys_idx.cuda(non_blocking=True) for crys_idx in input[4]])
+            else:
+                input_var = (Variable(input[0][0].cuda(non_blocking=True)),
+                            Variable(input[1].cuda(non_blocking=True)),
+                            input[2].cuda(non_blocking=True),
+                            [crys_idx.cuda(non_blocking=True) for crys_idx in input[3]],
+                            [crys_idx.cuda(non_blocking=True) for crys_idx in input[4]])
         else:
-            with torch.no_grad():
+            if model_orbital:
                 input_var = (Variable(torch.cat((input[0][0],input[0][1].reshape(int(input[0][1].shape[0]/32),1056)),dim=1)),
-                             Variable(input[1]),
-                             input[2],
-                             input[3])
+                         Variable(input[1]),
+                         input[2],
+                         input[3],
+                         input[4])
+            else:
+                input_var = (Variable(input[0][0]),
+                            Variable(input[1]),
+                            input[2],
+                            input[3],
+                            input[4])
         if args.task == 'regression':
             target_normed = normalizer.norm(target)
+            target1_normed = normalizer1.norm(target1)
+            target2_normed = normalizer2.norm(target2)
         else:
             target_normed = target.view(-1).long()
         if args.cuda:
@@ -189,19 +227,41 @@ def validate(val_loader, model, criterion, normalizer, test=False):
                 target_var = Variable(target_normed)
 
         # compute output
-        output = model(*input_var)
-        loss = criterion(output, target_var)
+        with torch.no_grad():
+            output, output1, output2 = model(*input_var)
+            
+        output_flat = torch.reshape(output, (-1,))
+        output1_flat = torch.reshape(output1, (-1,))
+        output2_flat = torch.reshape(output2, (-1,))
+        target_var_flat = torch.reshape(target_var, (-1,))
+        
+        output_filtered = output_flat[~torch.isnan(target_var_flat)]
+        target_var_filtered = target_var_flat[~torch.isnan(target_var_flat)]
+
+        loss = criterion(output_filtered, target_var_filtered)
   
         # measure accuracy and record loss
         if args.task == 'regression':
             mae_error = mae(normalizer.denorm(output.data.cpu()), target)
+            mae_error1 = mae(normalizer1.denorm(output1.data.cpu()), target1)
+            mae_error2 = mae(normalizer2.denorm(output2.data.cpu()), target2)
             losses.update(loss.data.cpu().item(), target.size(0))
-            mae_errors.update(mae_error, target.size(0))
+            mae_errors.update(mae_error, target[~torch.isnan(target)].size(0))
+            mae_errors1.update(mae_error1, target1[~torch.isnan(target1)].size(0))
+            mae_errors2.update(mae_error2, target2[~torch.isnan(target2)].size(0))
             if test:
                 test_pred = normalizer.denorm(output.data.cpu())
+                test_pred1 = normalizer1.denorm(output1.data.cpu())
+                test_pred2 = normalizer2.denorm(output2.data.cpu())
                 test_target = target
+                test_target1 = target1
+                test_target2 = target2
                 test_preds += test_pred.view(-1).tolist()
+                test_preds1 += test_pred1.view(-1).tolist()
+                test_preds2 += test_pred2.view(-1).tolist()
                 test_targets += test_target.view(-1).tolist()
+                test_targets1 += test_target1.view(-1).tolist()
+                test_targets2 += test_target2.view(-1).tolist()
                 test_cif_ids += batch_cif_ids
         else:
             accuracy, precision, recall, fscore, auc_score = \
@@ -224,26 +284,6 @@ def validate(val_loader, model, criterion, normalizer, test=False):
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if i % args.print_freq == 0:
-            if args.task == 'regression':
-                print('Test: [{0}/{1}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'MAE {mae_errors.val:.3f} ({mae_errors.avg:.3f})'.format(
-                    i, len(val_loader), batch_time=batch_time, loss=losses,
-                    mae_errors=mae_errors))
-            else:
-                print('Test: [{0}/{1}]\t'
-                      'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                      'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
-                      'Accu {accu.val:.3f} ({accu.avg:.3f})\t'
-                      'Precision {prec.val:.3f} ({prec.avg:.3f})\t'
-                      'Recall {recall.val:.3f} ({recall.avg:.3f})\t'
-                      'F1 {f1.val:.3f} ({f1.avg:.3f})\t'
-                      'AUC {auc.val:.3f} ({auc.avg:.3f})'.format(
-                    i, len(val_loader), batch_time=batch_time, loss=losses,
-                    accu=accuracies, prec=precisions, recall=recalls,
-                    f1=fscores, auc=auc_scores))
     del input
     del batch_cif_ids
     del target
@@ -254,14 +294,13 @@ def validate(val_loader, model, criterion, normalizer, test=False):
         import csv
         with open('test_results.csv', 'w') as f:
             writer = csv.writer(f)
-            for cif_id, target, pred in zip(test_cif_ids, test_targets,
-                                            test_preds):
+            for cif_id, target, pred in zip(test_cif_ids, test_targets, test_preds):
                 writer.writerow((cif_id, target, pred))
     else:
         star_label = '*'
     if args.task == 'regression':
-    	print(' {star} MAE {mae_errors.avg:.3f}'.format(star=star_label, mae_errors=mae_errors))
-    	return mae_errors.avg
+        print(' {star} MAE {mae_errors.avg:.3f}\t MAE1 {mae_errors1.avg:.3f}\t MAE2 {mae_errors2.avg:.3f}'.format(star=star_label, mae_errors=mae_errors, mae_errors1=mae_errors1, mae_errors2=mae_errors2))
+        return mae_errors.avg
     else:
         print(' {star} AUC {auc.avg:.3f}'.format(star=star_label,
                                                  auc=auc_scores))
@@ -301,6 +340,8 @@ def mae(prediction, target):
     prediction: torch.Tensor (N, 1)
     target: torch.Tensor (N, 1)
     """
+    prediction = prediction[~torch.isnan(target)]
+    target = target[~torch.isnan(target)]
     return torch.mean(torch.abs(target - prediction))
 
 

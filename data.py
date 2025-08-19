@@ -4,7 +4,7 @@ import json
 import os
 import random
 import warnings
-
+from sklearn.preprocessing import OneHotEncoder
 import numpy as np
 import torch
 from pymatgen.core.structure import Structure
@@ -66,10 +66,10 @@ def get_train_val_test_loader(dataset, collate_fn=default_collate,
 
     if kwargs['train_size']:
         train_size = kwargs['train_size']
-        print(train_size)
+        # print(train_size)
     else:
         train_size = int(train_ratio * total_size)
-        print(train_size)
+        # print(train_size)
     if kwargs['test_size']:
         test_size = kwargs['test_size']
     else:
@@ -172,6 +172,7 @@ def collate_pool(dataset_list): # batch the crystal atoms
             crystal_atom_idx),\
         torch.stack(batch_target, dim=0),\
         batch_cif_ids
+
 
 def calculateDistance(a,b):   # Atom-wise OFM
     dist =math.sqrt((a[0] - b[0])**2 + (a[1] - b[1])**2 + (a[2] - b[2])**2)
@@ -376,7 +377,14 @@ class CIFData(Dataset):
 
     @functools.lru_cache(maxsize=None)  # Cache loaded structures
     def __getitem__(self, idx):
-        cif_id, target = self.id_prop_data[idx]
+        cif_id, target= self.id_prop_data[idx]
+
+        # print(hal_site)
+        # print(inorga_site)
+        # print(orga_site)
+
+        #band_feat = one_hot_encoding(orga_site,inorga_site,hal_site,tf) 
+
         crystal = Structure.from_file(os.path.join(self.root_dir,
                                                    cif_id+'.cif'))
         atom_fea = np.vstack([self.ari.get_atom_fea(crystal[i].specie.number)
