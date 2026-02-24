@@ -8,9 +8,9 @@ By running the script with the `--orbital` flag, you activate the BE-OGCNN archi
 
 The methodology in this repository is heavily inspired and modified from the following works:
 
-1. **BE-CGCNN**: *Bond Embedding Crystal Graph Convolutional Neural Network*
+1. **BE-CGCNN**: *Machine learning-enabled exploration of the electrochemical stability of real-scale metallic nanoparticles*
    DOI: [10.1038/s41467-023-38758-1](https://doi.org/10.1038/s41467-023-38758-1)
-2. **OGCNN**: *Machine learning reveals orbital interaction in crystalline materials*
+2. **OGCNN**: *Orbital graph convolutional neural network for material property prediction*
    DOI: [10.1103/PhysRevMaterials.4.093801](https://doi.org/10.1103/PhysRevMaterials.4.093801)
 
 ## Prerequisites
