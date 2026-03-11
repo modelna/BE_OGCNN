@@ -511,7 +511,6 @@ class CIFData(Dataset):
             ads_idx = np.array([0])
         ads_idx = torch.LongTensor(ads_idx)
         target = atoms.info.get('ad',np.nan)
-        env = atoms.info.get('env', 'in-house')
         if 'd_band_centers' in atoms.arrays.keys():
             target = atoms.arrays['d_band_centers']
         else:
