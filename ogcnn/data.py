@@ -512,9 +512,9 @@ class CIFData(Dataset):
         ads_idx = torch.LongTensor(ads_idx)
         target = atoms.info.get('ad',np.nan)
         if 'd_band_centers' in atoms.arrays.keys():
-            target = atoms.arrays['d_band_centers']
+            target1 = atoms.arrays['d_band_centers']
         else:
-            target = np.array([np.nan]*len(atoms))
+            target1 = np.array([np.nan]*len(atoms))
         if atoms.calc is None:
             target2 = np.nan
         else:
